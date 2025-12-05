@@ -156,7 +156,46 @@ cv_results_logistic <-
 cv_results_logistic |> 
   collect_metrics()
 
+install.packages("themis")
+library("themis")
+# 1. Logistic regression baseline recipe
+# --------------------------------------
+logistic_recipe <-
+  recipe(churn ~ ., data = analysis_set) |>
+  update_role(id, new_role = "metadata") |>
+  step_dummy(all_nominal_predictors()) |>
+  step_normalize(all_predictors())
 
+
+# 2. Random forest recipe (with downsampling)
+# -------------------------------------------------------------
+rf_recipe <-
+  recipe(churn ~ ., data = analysis_set) |>
+  update_role(id, new_role = "metadata") |>
+  themis::step_downsample(churn)
+
+rf_recipe
+
+# 3. Gradient boosted tree (xgboost) recipe 
+# ------------------------------------------------------------
+xgb_recipe <-
+  recipe(churn ~ ., data = analysis_set) |>
+  # remove id from the predictors (xgboost doesnt need an ID column)
+  step_rm(id) |>
+  # one-hot encode all categorical predictors (as in the xgb)
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) |>
+  # handle class imbalance
+  themis::step_downsample(churn)
+xgb_recipe
+
+#Check for later
+logistic_recipe |> summary()
+rf_recipe |> summary()
+xgb_recipe |> summary()
+
+glimpse(logistic_recipe)
+glimpse(rf_recipe)
+glimpse(xgb_recipe)
 
 ##########################################################################
 # TODO: Identify and train a better predicting model and 
@@ -172,6 +211,7 @@ cv_results_logistic |>
 ########################################################################## 
 # TODO: Demonstrate how to use the model to select which
 #       customers we will contact
+
 
 
 

@@ -1,0 +1,380 @@
+---
+title: "ML group assignment code"
+author: "Shinyoung Kim"
+date: "2025-12-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(themis)
+library(skimr)
+library(ggridges)
+library(vip)
+library(future)
+library(parallel)
+```
+
+```{r}
+# Load customer data
+load('customers.RData')
+
+
+# Configure parallel execution of code
+future::plan(future::multisession(
+  workers = parallel::detectCores() - 1))
+
+# Colorbind-safe palette:
+pal <- c("#E69F00", "#56B4E9", "#009E73", 
+         "#0072B2", "#D55E00", "#CC79A7", "#F0E442")
+
+```
+# Data Investigation
+```{r}
+# Split the data:
+# * The analysis set will contain all observations from the start
+#   of record keeping through the end of calendar year 2024
+# * The assessment set will contain all observations from calendar
+#   year 2025.
+
+
+# about 80% of the data is in the analysis set:
+prop_analysis <- summarise(customers, p = sum(year < 2025)/n())$p
+prop_analysis
+
+# set the seed for reproducibility
+set.seed(101)
+
+# `initial_time_split` splits the data based on row ordering. The `customers`
+# data frame is already sorted by year. By splitting the first
+# `prop_analysis` observations into the analysis set, the analysis set will
+# contain all pre-2025 observations, and the assessment set will contain all
+# 2025 observations.
+split <- initial_time_split(customers, prop = prop_analysis)
+analysis_set <- training(split)
+# [Addition to the code] Create the assessment set (2025 data)
+assessment_set <- testing(split)
+
+# [Addition to the code] Sanity Check: Verify the years in each set
+cat("Analysis Set Years: ", paste(range(analysis_set$year), collapse = " - "), "\n")
+cat("Assessment Set Years: ", paste(range(assessment_set$year), collapse = " - "), "\n")
+
+
+skim(analysis_set)
+
+
+# [Addition to the code] Check dimensions
+dim(analysis_set)
+dim(assessment_set)
+
+# [Addition to the code] Check Churn Rate in Analysis Set
+analysis_set |> 
+  count(churn) |> 
+  mutate(prop = n / sum(n))
+
+# [Addition to the code] Prepare the summary data first for easier labeling
+churn_summary <- analysis_set |>
+  count(churn) |>
+  mutate(
+    prop = n / sum(n),
+    label = paste0(scales::percent(prop, accuracy = 1), "\n(", n, ")")
+  )
+
+# [Addition to the code] Visualizing the Class Imbalance
+
+theme_set(theme_minimal(base_size = 14))
+
+p1_pie <- churn_summary |>
+  ggplot(aes(x = "", y = prop, fill = churn)) +
+  geom_bar(stat = "identity", width = 1, color = "white") +
+  coord_polar("y", start = 0) +
+  scale_fill_manual(values = c("churned" = "#D55E00", "renewed" = "#009E73")) +
+
+  geom_text(aes(label = label),
+            position = position_stack(vjust = 0.5),
+            color = "white",
+            fontface = "bold",
+            size = 5) +
+  labs(
+    title = "Current Churn Landscape (2024 & prior)",
+    fill = "Status"
+  ) +
+  theme_void() +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 16))
+
+print(p1_pie)
+
+# [Addition to the code] Boxplot of Tenure by Churn status
+
+p2 <- analysis_set |>
+  ggplot(aes(x = churn, y = tenure, fill = churn)) +
+  geom_boxplot(alpha = 0.6) +
+  scale_fill_manual(values = c("churned" = "#D55E00", "renewed" = "#009E73")) +
+  labs(
+    title = "Customer Tenure vs. Churn Decisions",
+    subtitle = "Newer customers (lower tenure) appear more likely to churn",
+    x = NULL,
+    y = "Years as Customer"
+  ) +
+  theme(legend.position = "none")
+
+print(p2)
+
+# [Addition to the code] Churn rates by Sector and Company Size
+
+p3 <- analysis_set |>
+  group_by(sector, size) |>
+  summarise(churn_rate = mean(churn == "churned"), .groups = "drop") |>
+  ggplot(aes(x = sector, y = churn_rate, fill = size)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = pal[1:3]) + # Uses Parker's palette
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Risk Profile by Sector and Size",
+    subtitle = "Large companies in Sector C have the highest churn risk",
+    x = "Industry Sector",
+    y = "Churn Rate",
+    fill = "Company Size"
+  )
+
+print(p3)
+
+
+# Create CV folds. By choosing v = 5, the train/test split within each CV fold
+# will be about 80% training and 20% test. That roughly matches the proportion
+# that will eventually be used for the final assessment.
+folds <- vfold_cv(training(split), v = 5, repeats = 4)
+
+```
+
+# Model 1: Logistics Regression
+```{r}
+# Define a workflow for logistic regression
+wf_logistic <-
+  workflow() |> 
+  add_recipe(
+    recipe(formula = churn ~ ., data = analysis_set) |> 
+      update_role(id, new_role = 'metadata') |> 
+      step_dummy(all_nominal_predictors()) |> 
+      step_interact(~all_predictors():all_predictors()) |> 
+      step_zv(all_predictors())) |> 
+  add_model(logistic_reg(engine = 'glm'))
+
+# Evaluate the baseline model using cross validation. I use the `tune_grid`
+# function for this even though there is no tuning to be done. The
+# `suppressWarnings` call at the end stops `tune_grid` from printing a warning
+# about the lack of tunable parameters.
+cv_results_logistic <- 
+  wf_logistic |> 
+  tune_grid(folds,
+            metrics = metric_set(roc_auc, recall, precision,
+                                 kap, bal_accuracy, f_meas),
+            control = control_grid(save_pred = TRUE, 
+                                   parallel_over = 'resamples')) |> 
+  suppressWarnings()
+
+# Baseline statistics calculated from CV predictions:
+print("Logistic Regression Results:")
+cv_results_logistic |> 
+  collect_metrics()
+```
+
+# Model 2 Random Forest (Tuned)
+```{r}
+# Define a workflow for Random Forest
+# Note: RF does not need interaction terms, so we use a simpler recipe.
+wf_rf <-
+  workflow() |> 
+  add_recipe(
+    recipe(formula = churn ~ ., data = analysis_set) |> 
+      update_role(id, new_role = 'metadata') |> 
+      step_dummy(all_nominal_predictors()) |> 
+      step_zv(all_predictors())) |> 
+  add_model(
+    rand_forest(mtry = tune(), min_n = tune(), trees = 1000) |> 
+      set_engine("ranger", importance = "impurity") |> 
+      set_mode("classification")
+  )
+
+
+
+rf_recipe_downsample <- 
+  recipe(loan_status ~ ., data = home_improv_train) |> 
+  update_role(emp_length, id, total_pymnt, recoveries, 
+              funded_amnt, fico_range_low, 
+              new_role = "metadata") |> 
+  themis::step_downsample(loan_status)
+
+
+
+# Tune the model using cross validation. 
+# We add `grid = 10` to let tidymodels try 10 random hyperparameter combinations.
+cv_results_rf <- 
+  wf_rf |> 
+  tune_grid(folds,
+            grid = 10,
+            metrics = metric_set(roc_auc, recall, precision, 
+                                 kap, bal_accuracy, f_meas),
+            control = control_grid(save_pred = TRUE, 
+                                   parallel_over = 'resamples'))
+
+# Random Forest statistics:
+print("Random Forest Results:")
+cv_results_rf |> 
+  show_best(metric = "roc_auc")
+```
+
+# Model 3: XGBoost (Tuned)
+```{r}
+# Define a workflow for XGBoost
+# Note: XGBoost requires one-hot encoding (one_hot = TRUE) for factors.
+wf_xgb <-
+  workflow() |> 
+  add_recipe(
+    recipe(formula = churn ~ ., data = analysis_set) |> 
+      update_role(id, new_role = 'metadata') |> 
+      step_dummy(all_nominal_predictors(), one_hot = TRUE) |> 
+      step_zv(all_predictors())) |> 
+  add_model(
+    boost_tree(trees = 1000, tree_depth = tune(), min_n = tune(), 
+               loss_reduction = tune(), sample_size = tune(), 
+               mtry = tune(), learn_rate = tune()) |> 
+      set_engine("xgboost") |> 
+      set_mode("classification")
+  )
+
+# Tune the model using cross validation.
+# We use `grid = 15` to try 15 combinations, as XGBoost has many parameters.
+cv_results_xgb <- 
+  wf_xgb |> 
+  tune_grid(folds,
+            grid = 15,
+            metrics = metric_set(roc_auc, recall, precision, 
+                                 kap, bal_accuracy, f_meas),
+            control = control_grid(save_pred = TRUE, 
+                                   parallel_over = 'resamples'))
+
+# XGBoost statistics:
+print("XGBoost Results:")
+cv_results_xgb |> 
+  show_best(metric = "roc_auc")
+```
+
+
+# Comparison
+```{r}
+# 1. Collect metrics from all three models
+log_metrics <- collect_metrics(cv_results_logistic) |> mutate(model = "Logistic")
+rf_metrics  <- show_best(cv_results_rf, metric = "roc_auc", n = 1) |> mutate(model = "Random Forest")
+xgb_metrics <- show_best(cv_results_xgb, metric = "roc_auc", n = 1) |> mutate(model = "XGBoost")
+
+# 2. Bind them together and sort by ROC_AUC
+comparison_table <- bind_rows(log_metrics, rf_metrics, xgb_metrics) |> 
+  select(model, .metric, mean, std_err) |> 
+  filter(.metric == "roc_auc") |> 
+  arrange(desc(mean))
+
+# 3. Print the winner
+print(comparison_table)
+```
+
+
+# Final Model Training & Strategy
+```{r}
+# 1. SELECT BEST MODEL & FINALIZE
+# ------------------------------------------------------------------------------
+# We select the best hyperparameters based on ROC AUC from our tuning results.
+# (Assuming XGBoost was the winner. If RF won, change 'cv_results_xgb' to 'cv_results_rf')
+
+best_params <- select_best(cv_results_xgb, metric = "roc_auc")
+
+final_wf <- wf_xgb |> 
+  finalize_workflow(best_params)
+
+# 2. TRAIN FINAL MODEL
+# We fit the finalized workflow on the ENTIRE analysis set (all history < 2025).
+# This gives the model the maximum amount of data to learn from.
+
+set.seed(999)
+final_fit <- fit(final_wf, data = analysis_set)
+
+# 3. PREDICT CHURN FOR 2025
+# We use the model to generate probabilities (.pred_churned) for the 2025 data.
+
+predictions_2025 <- augment(final_fit, new_data = assessment_set)
+
+# 4. COMPUTE EXPECTED VALUE & RANK CUSTOMERS
+# ------------------------------------------------------------------------------
+# Logic:
+# - Expected Loss = Probability of Churn * Predicted 2025 Spend
+# - Net Value = Expected Loss - Cost of Retention (€20,000)
+# - Decision: We only target customers where the Net Value is POSITIVE (> 0).
+
+retention_cost <- 20000
+
+strategy_data <- predictions_2025 |> 
+  select(id, spend, .pred_churned) |> 
+  mutate(
+    # Calculate financial risk
+    expected_loss = .pred_churned * spend,
+    
+    # Calculate net value of saving this customer
+    net_value = expected_loss - retention_cost,
+    
+    # Determine if we should target them (Is it profitable?)
+    target_customer = net_value > 0
+  ) |> 
+  # Rank customers: Highest Net Value at the top
+  arrange(desc(net_value)) |> 
+  mutate(
+    rank = row_number(),
+    cumulative_value = cumsum(net_value)
+  )
+
+
+# 5. DETERMINE OPTIMAL NUMBER TO TARGET
+# ------------------------------------------------------------------------------
+
+# Filter to the list of profitable targets
+target_list <- strategy_data |> 
+  filter(target_customer == TRUE)
+
+optimal_count <- nrow(target_list)
+total_profit <- sum(target_list$net_value)
+
+# Print Summary for Presentation
+cat("--- STRATEGY SUMMARY ---\n")
+cat("Optimal number of customers to target:", optimal_count, "\n")
+cat("Total Expected Value of Retention Plan: €", format(round(total_profit), big.mark=","), "\n")
+
+```
+
+# Visualize optimal targeting
+```{r}
+# This plot shows the "peak" profit point.
+ggplot(strategy_data, aes(x = rank, y = cumulative_value)) +
+  geom_line(color = "#0072B2", linewidth = 1.2) +
+  
+  # Add a vertical line at the optimal cutoff
+  geom_vline(xintercept = optimal_count, linetype = "dashed", color = "red") +
+  
+  # Annotate the cutoff point
+  annotate("text", x = optimal_count + 50, y = 0, 
+           label = paste("Optimal Cutoff:", optimal_count, "Customers"), 
+           color = "red", angle = 90, vjust = -0.5) +
+  
+  labs(title = "Optimization of Retention Campaign",
+       subtitle = paste0("Targeting the top ", optimal_count, 
+                         " customers yields €", format(round(total_profit/1e6, 1)), "M in value"),
+       x = "Number of Customers Targeted (Ranked by Value)",
+       y = "Cumulative Net Expected Value (€)") +
+  
+  scale_y_continuous(labels = scales::label_dollar(prefix = "€", scale = 1e-6, suffix = "M")) +
+  theme_minimal(base_size = 14)
+```

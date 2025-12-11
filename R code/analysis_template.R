@@ -1,9 +1,14 @@
 # Load packages
 library(tidyverse)
 library(tidymodels)
+library(themis)
+library(skimr)
+library(ggridges)
+library(vip)
 
 # Load customer data
 load('customers.RData')
+
 
 # Configure parallel execution of code
 future::plan(future::multisession(
@@ -124,9 +129,15 @@ print(p3)
 # that will eventually be used for the final assessment.
 folds <- vfold_cv(training(split), v = 5, repeats = 4)
 
+# We define the metrics here so they can be used in tuning below.
+# mn_log_loss is added for probability calibration.
+my_metrics <- metric_set(roc_auc, pr_auc, mn_log_loss, accuracy)
+
 
 ##########################################################################
-# Fit a simple logistic regression as a baseline model. Nothing fancy.
+# Modeling
+##########################################################################
+# MODEL 1: LOGISTIC REGRESSION (BASELINE) ------------------------------
 
 # Define a workflow for logistic regression
 wf_logistic <-
@@ -153,11 +164,175 @@ cv_results_logistic <-
   suppressWarnings()
 
 # Baseline statistics calculated from CV predictions:
+print("Logistic Regression Results:")
 cv_results_logistic |> 
   collect_metrics()
 
-install.packages("themis")
-library("themis")
+# --- MODEL 2: RANDOM FOREST ---
+
+# Specification: Tuning mtry (vars per split) and min_n (node size)
+rf_spec <- 
+  rand_forest(mtry = tune(), min_n = tune(), trees = 1000) |> 
+  set_engine("ranger", importance = "impurity") |> 
+  set_mode("classification")
+
+# Recipe: Trees generally don't need interaction terms or one-hot encoding,
+# but tidymodels handles factors automatically. We just remove ID.
+tree_recipe <- 
+  recipe(churn ~ ., data = analysis_set) |> 
+  update_role(id, new_role = 'metadata') |> 
+  step_dummy(all_nominal_predictors()) |> # Dummy encoding is safe for Ranger
+  step_zv(all_predictors())
+
+wf_rf <- 
+  workflow() |> 
+  add_recipe(tree_recipe) |> 
+  add_model(rf_spec)
+
+# Tuning
+# We let tidymodels pick 10 random combinations to try
+print("Tuning Random Forest...")
+tune_rf <- 
+  wf_rf |> 
+  tune_grid(folds,
+            grid = 10, 
+            metrics = my_metrics,
+            control = control_grid(save_pred = TRUE, parallel_over = 'resamples'))
+
+# Show best RF results
+tune_rf |> show_best(metric = "roc_auc")
+
+
+
+# ==============================================================================
+# MODEL 2: XGBOOST  ----------------------------
+# ==============================================================================
+
+# Specification: Tuning tree depth, learn rate, and loss reduction
+xgb_spec <- 
+  boost_tree(
+    trees = 1000, 
+    tree_depth = tune(), 
+    min_n = tune(), 
+    loss_reduction = tune(),                     
+    sample_size = tune(), 
+    mtry = tune(),         
+    learn_rate = tune()                          
+  ) |> 
+  set_engine("xgboost") |> 
+  set_mode("classification")
+
+# Recipe: XGBoost requires all numeric input (one-hot encoding)
+xgb_recipe <- 
+  recipe(churn ~ ., data = analysis_set) |> 
+  update_role(id, new_role = 'metadata') |> 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) |> 
+  step_zv(all_predictors())
+
+wf_xgb <- 
+  workflow() |> 
+  add_recipe(xgb_recipe) |> 
+  add_model(xgb_spec)
+
+# Tuning: Using a Latin Hypercube grid for better coverage of many parameters
+xgb_grid <- grid_latin_hypercube(
+  tree_depth(),
+  min_n(),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  finalize(mtry(), analysis_set),
+  learn_rate(),
+  size = 15 # Try 15 combinations
+)
+
+print("Tuning XGBoost...")
+tune_xgb <- 
+  wf_xgb |> 
+  tune_grid(folds,
+            grid = xgb_grid,
+            metrics = my_metrics,
+            control = control_grid(save_pred = TRUE, parallel_over = 'resamples'))
+
+# Show best XGB results
+tune_xgb |> show_best(metric = "roc_auc")
+
+# ==============================================================================
+# 7. MODEL SELECTION & FINAL FIT ------------------------------------------
+# ==============================================================================
+
+# Compare all three models
+results_log <- collect_metrics(cv_results_logistic) |> mutate(model = "Logistic")
+results_rf  <- collect_metrics(tune_rf) |> mutate(model = "Random Forest")
+results_xgb <- collect_metrics(tune_xgb) |> mutate(model = "XGBoost")
+
+# Combine and look at ROC AUC
+bind_rows(results_log, results_rf, results_xgb) |> 
+  filter(.metric == "roc_auc") |> 
+  group_by(model) |> 
+  slice_max(mean, n = 1) |> 
+  arrange(desc(mean))
+
+# Let's assume XGBoost won (common in this data). We select the best parameters.
+best_xgb <- select_best(tune_xgb, metric = "roc_auc")
+
+# Finalize workflow with best parameters
+final_wf <- wf_xgb |> finalize_workflow(best_xgb)
+
+# Fit on the FULL analysis set (years < 2025)
+final_fit <- fit(final_wf, data = analysis_set)
+
+
+# ==============================================================================
+# 8. DEMONSTRATION (THE BUSINESS CASE) ------------------------------------
+# ==============================================================================
+# "Using the model trained on the entire analysis set, generate soft predictions 
+#  for all observations in the assessment set (i.e., customer data from 2025)."
+
+# 1. Predict Probabilities for 2025
+pred_2025 <- augment(final_fit, new_data = assessment_set)
+
+# 2. Calculate Expected Loss and Net Value
+# Formula: E[Lost Revenue] = Spend_2025 * Prob(Churn)
+# Decision: Target if E[Lost Revenue] > Retention Cost (€20,000)
+
+retention_cost <- 20000
+
+business_impact <- pred_2025 |> 
+  select(id, spend, .pred_churned) |> 
+  mutate(
+    expected_loss = spend * .pred_churned,
+    should_target = expected_loss > retention_cost,
+    net_value_of_retention = expected_loss - retention_cost
+  ) |> 
+  arrange(desc(net_value_of_retention))
+
+# 3. Summary for Presentation
+# How many people to target?
+target_count <- sum(business_impact$should_target)
+total_exp_value <- sum(business_impact$net_value_of_retention[business_impact$should_target])
+
+cat("\n--- Business Recommendation ---\n")
+cat("Optimal number of customers to target:", target_count, "\n")
+cat("Total Expected Value of Retention Plan: €", format(round(total_exp_value), big.mark=","), "\n")
+
+# 4. Visualization: Cumulative Value Curve (Great for the presentation!)
+# This shows where the profit peaks
+business_impact |> 
+  mutate(
+    rank = row_number(),
+    cumulative_value = cumsum(net_value_of_retention)
+  ) |> 
+  ggplot(aes(x = rank, y = cumulative_value)) +
+  geom_line(color = "blue", size = 1.2) +
+  geom_vline(xintercept = target_count, linetype = "dashed", color = "red") +
+  annotate("text", x = target_count + 50, y = 0, label = "Optimal Cutoff", color = "red", angle = 90) +
+  labs(title = "Optimization of Retention Campaign",
+       subtitle = "Cumulative Net Value by Customer Rank",
+       x = "Number of Customers Targeted",
+       y = "Cumulative Expected Value (€)") +
+  theme_minimal()
+
+# =====================================================================
 # 1. Logistic regression baseline recipe
 # --------------------------------------
 logistic_recipe <-
@@ -196,6 +371,8 @@ xgb_recipe |> summary()
 glimpse(logistic_recipe)
 glimpse(rf_recipe)
 glimpse(xgb_recipe)
+
+
 
 ##########################################################################
 # TODO: Identify and train a better predicting model and 

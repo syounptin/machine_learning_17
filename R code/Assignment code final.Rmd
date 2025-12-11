@@ -1,0 +1,1131 @@
+---
+title: "ML group assignment code"
+author: "Shinyoung Kim"
+date: "2025-12-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(themis)
+library(skimr)
+library(ggridges)
+library(vip)
+library(future)
+library(parallel)
+```
+
+# Part 0: Setup & Data loading
+```{r}
+# Load customer data
+load('customers.RData')
+
+
+# Configure parallel execution of code
+future::plan(future::multisession(
+  workers = parallel::detectCores() - 1))
+
+# Colorbind-safe palette:
+pal <- c("#E69F00", "#56B4E9", "#009E73", 
+         "#0072B2", "#D55E00", "#CC79A7", "#F0E442")
+
+# Global constants
+RETENTION_COST <- 20000
+```
+
+# Part 1: Data Exploration
+```{r data spliting}
+# Split the data
+# about 80% of the data is in the analysis set:
+prop_analysis <- summarise(customers, p = sum(year < 2025)/n())$p
+prop_analysis
+
+# set the seed for reproducibility
+set.seed(101)
+
+# `initial_time_split` splits the data based on row ordering. The `customers`
+# data frame is already sorted by year. By splitting the first
+# `prop_analysis` observations into the analysis set, the analysis set will
+# contain all pre-2025 observations, and the assessment set will contain all
+# 2025 observations.
+split <- initial_time_split(customers, prop = prop_analysis)
+analysis_set <- training(split)
+# [Addition to the code] Create the assessment set (2025 data)
+assessment_set <- testing(split)
+
+# [Addition to the code] Verification
+cat("\nAnalysis Set Years:", paste(range(analysis_set$year), collapse = " - "), "\n")
+cat("Assessment Set Years:", paste(range(assessment_set$year), collapse = " - "), "\n")
+cat("Analysis Set Size:", nrow(analysis_set), "\n")
+cat("Assessment Set Size:", nrow(assessment_set), "\n")
+
+# Create CV folds
+folds <- vfold_cv(training(split), v = 5, repeats = 4)
+```
+
+```{r basic plots}
+# Class distribution
+churn_summary <- analysis_set |>
+  count(churn) |>
+  mutate(
+    prop = n / sum(n),
+    label = paste0(percent(prop, accuracy = 0.1), "\n(n=", 
+                   scales::comma(n), ")")
+  )
+
+# [Addition to the code] Visualizing the Class Imbalance
+theme_set(theme_minimal(base_size = 14))
+
+# 1. Class Imbalance Visualization
+p1 <- churn_summary |>
+  ggplot(aes(x = "", y = prop, fill = churn)) +
+  geom_bar(stat = "identity", width = 1, color = "white") +
+  coord_polar("y", start = 0) +
+  scale_fill_manual(values = c("churned" = "#D55E00", "renewed" = "#009E73")) +
+
+  geom_text(aes(label = label),
+            position = position_stack(vjust = 0.5),
+            color = "white",
+            fontface = "bold",
+            size = 5) +
+  labs(
+    title = "Current Churn Landscape (2024 & prior)",
+    fill = "Status"
+  ) +
+  theme_void() +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 16))
+
+print(p1)
+
+
+# 2. Boxplot of Tenure by Churn status
+p2 <- analysis_set |>
+  ggplot(aes(x = churn, y = tenure, fill = churn)) +
+  geom_boxplot(alpha = 0.6) +
+  scale_fill_manual(values = c("churned" = "#D55E00", "renewed" = "#009E73")) +
+  labs(
+    title = "Customer Tenure vs. Churn Decisions",
+    subtitle = "Newer customers (lower tenure) appear more likely to churn",
+    x = NULL,
+    y = "Years as Customer"
+  ) +
+  theme(legend.position = "none")
+
+print(p2)
+
+# 3. Churn rates by Sector and Company Size
+p3 <- analysis_set |>
+  group_by(sector, size) |>
+  summarise(churn_rate = mean(churn == "churned"), .groups = "drop") |>
+  ggplot(aes(x = sector, y = churn_rate, fill = size)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = pal[1:3]) + # Uses Parker's palette
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Risk Profile by Sector and Size",
+    subtitle = "Large companies in Sector C have the highest churn risk",
+    x = "Industry Sector",
+    y = "Churn Rate",
+    fill = "Company Size"
+  )
+
+print(p3)
+```
+
+```{r additional graphs}
+# Summary statistics
+revenue_summary <- analysis_set |> 
+  group_by(churn) |> 
+  summarise(
+    median_spend = median(spend),
+    mean_spend = mean(spend),
+    total_revenue = sum(spend),
+    n = n()
+  ) |> 
+  mutate(
+    avg_value_lost_if_churned = total_revenue / sum(total_revenue)
+  )
+
+print(revenue_summary)
+
+# Critical visualization: Ridge plot showing spend distribution
+p_revenue <- analysis_set |> 
+  ggplot(aes(x = spend, y = churn, fill = churn)) +
+  geom_density_ridges(alpha = 0.7, scale = 2) +
+  scale_x_log10(labels = scales::label_dollar(prefix = "€")) +
+  scale_fill_manual(values = c("renewed" = pal[3], "churned" = pal[5])) +
+  labs(
+    title = "Revenue Distribution by Churn Status",
+    subtitle = "Are high-value customers more or less likely to churn?",
+    x = "Annual Customer Spend (log scale)",
+    y = "Churn Status"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+
+print(p_revenue)
+
+# Segment customers by revenue and actual outcome
+analysis_set |> 
+  mutate(
+    revenue_tier = if_else(spend >= median(spend), "High Revenue", "Low Revenue")
+  ) |> 
+  count(revenue_tier, churn) |> 
+  group_by(revenue_tier) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = revenue_tier, y = prop, fill = churn)) +
+  geom_col(position = "fill") +
+  geom_text(aes(label = paste0(scales::percent(prop, accuracy = 0.1), "\n(n=", n, ")")),
+            position = position_fill(vjust = 0.5),
+            color = "white", size = 5, fontface = "bold") +
+  scale_fill_manual(values = c("renewed" = pal[3], "churned" = pal[5])) +
+  labs(
+    title = "Revenue Alone Isn't Enough",
+    subtitle = "Even high-revenue customers churn at significant rates",
+    x = "Customer Revenue Tier",
+    y = "Proportion"
+  ) +
+  theme_minimal(base_size = 16)
+```
+
+```{r premium}
+cat("=== DOES PREMIUM SERVICE REDUCE CHURN? ===\n\n")
+
+# Calculate premium service impact on churn
+premium_analysis <- analysis_set |> 
+  group_by(premium, churn) |> 
+  summarise(
+    n = n(),
+    avg_spend = mean(spend),
+    total_revenue = sum(spend),
+    .groups = "drop"
+  ) |> 
+  group_by(premium) |> 
+  mutate(
+    total_customers = sum(n),
+    churn_rate = n[churn == "churned"] / total_customers,
+    revenue_share = total_revenue / sum(total_revenue)
+  ) |> 
+  filter(churn == "churned") |> 
+  select(premium, n, avg_spend, total_customers, churn_rate)
+
+# Clean display
+premium_summary <- premium_analysis |> 
+  mutate(
+    Service_Type = if_else(premium == "1", "Premium", "Standard"),
+    Customers = total_customers,
+    Churn_Rate = scales::percent(churn_rate, accuracy = 0.1),
+    Avg_Spend = scales::dollar(avg_spend, prefix = "€"),
+    Churned = n
+  ) |> 
+  select(Service_Type, Customers, Churned, Churn_Rate, Avg_Spend)
+
+print(premium_summary)
+
+# Calculate the difference
+standard_churn <- premium_analysis |> 
+  filter(premium == "0") |> 
+  pull(churn_rate)
+
+premium_churn <- premium_analysis |> 
+  filter(premium == "1") |> 
+  pull(churn_rate)
+
+churn_diff <- premium_churn - standard_churn
+diff_pct <- (premium_churn - standard_churn) / standard_churn
+
+cat("\n--- KEY FINDINGS ---\n")
+cat("Standard service churn rate:", scales::percent(standard_churn, accuracy = 0.1), "\n")
+cat("Premium service churn rate: ", scales::percent(premium_churn, accuracy = 0.1), "\n")
+cat("Difference:", 
+    scales::percent(abs(churn_diff), accuracy = 0.1),
+    if_else(churn_diff > 0, "HIGHER", "LOWER"), 
+    "for premium customers\n")
+cat("Relative change:", scales::percent(diff_pct, accuracy = 0.1), "\n\n")
+
+# INTERPRETATION
+if(premium_churn > standard_churn) {
+  cat("⚠️  CRITICAL INSIGHT: Premium customers churn at HIGHER rates!\n\n")
+  cat("BUSINESS IMPLICATIONS:\n")
+  cat("1. Premium pricing may not deliver sufficient value\n")
+  cat("2. Premium customers may have higher/different expectations\n")
+  cat("3. Premium service might attract riskier customer segments\n")
+  cat("4. Consider: Premium customer satisfaction surveys\n")
+  cat("5. Consider: Review premium service delivery and support\n\n")
+  cat("RETENTION STRATEGY:\n")
+  cat("→ Premium customers should be TOP PRIORITY for retention efforts\n")
+  cat("→ Their higher spend makes them more valuable, but also higher risk\n\n")
+} else {
+  cat("✓ POSITIVE: Premium service appears to reduce churn\n\n")
+  cat("BUSINESS IMPLICATIONS:\n")
+  cat("1. Premium offering creates customer stickiness\n")
+  cat("2. Consider upselling more standard customers to premium\n")
+  cat("3. Premium customers generate more stable revenue\n\n")
+}
+
+# Create the premium_viz_data object
+premium_viz_data <- analysis_set |> 
+  mutate(Service = if_else(premium == "1", "Premium", "Standard")) |> 
+  group_by(Service, churn) |> 
+  summarise(n = n(), .groups = "drop") |> 
+  group_by(Service) |> 
+  mutate(
+    total = sum(n),
+    prop = n / total
+  )
+
+# Verify the data looks correct
+print(premium_viz_data)
+
+# Create the visualization
+premium_viz_data |> 
+  filter(churn == "churned") |> 
+  ggplot(aes(x = Service, y = prop, fill = Service)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = scales::percent(prop, accuracy = 0.1)),
+            vjust = -0.5, size = 5, fontface = "bold") +
+  scale_y_continuous(labels = scales::percent_format(),
+                     limits = c(0, 0.5),
+                     expand = expansion(mult = c(0, 0.1))) +
+  scale_fill_manual(values = c("Standard" = pal[6], "Premium" = pal[5])) +
+  labs(
+    title = "Premium Customers Churn at HIGHER Rates",
+    subtitle = "This is the opposite of what we expected",
+    x = NULL,
+    y = "Churn Rate"
+  ) +
+  theme_minimal(base_size = 18) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", size = 20),
+    plot.subtitle = element_text(size = 16),
+    panel.grid.major.x = element_blank()
+  )
+```
+
+# Part 2: Model Building
+We will train and compare:
+1. Logistic Regression (baseline)
+2. Random Forest (tree-based ensemble)
+3. XGBoost (boosted trees - REQUIRED by assignment)
+
+--- SELECTED EVALUATION METRICS ---
+
+We use the following metrics to assess model performance:
+
+1. ROC AUC (PRIMARY METRIC):
+   - Measures ability to RANK customers by churn risk
+   - Critical because we need to rank customers by expected loss
+   - Threshold-independent: works regardless of cutoff choice
+
+2. PRECISION:
+   - Of customers we target, what % actually churn?
+   - Important because false positives waste €20K per customer
+   - High precision = efficient use of retention budget
+
+3. RECALL:
+   - Of customers who churn, what % do we identify?
+   - Important because missed churners = lost revenue
+   - Trade-off with precision: need to balance both
+
+4. F-MEASURE:
+   - Harmonic mean of precision and recall
+   - Balances the two competing objectives
+
+5. BALANCED ACCURACY:
+   - Average of sensitivity and specificity
+   - Handles class imbalance better than raw accuracy
+
+6. KAPPA:
+   - Agreement beyond chance
+   - Accounts for class imbalance
+
+PRIMARY FOCUS: ROC AUC for ranking + F-measure for classification quality
+
+## Model 1: Logistics Regression
+```{r}
+# Define recipe for logistic regression
+recipe_logistic <- recipe(formula = churn ~ ., data = analysis_set) |> 
+  update_role(id, new_role = 'metadata') |> 
+  step_dummy(all_nominal_predictors()) |> 
+  step_interact(~all_predictors():all_predictors()) |> 
+  step_zv(all_predictors())
+
+# Define model specification
+spec_logistic <- logistic_reg() |> 
+  set_engine('glm') |> 
+  set_mode('classification')
+
+# Create workflow
+wf_logistic <- workflow() |> 
+  add_recipe(recipe_logistic) |> 
+  add_model(spec_logistic)
+
+# Train and evaluate using cross-validation
+cat("Training logistic regression with 5-fold CV (4 repeats)...\n")
+
+cv_results_logistic <- wf_logistic |> 
+  tune_grid(
+    resamples = folds,
+    metrics = metric_set(roc_auc, recall, precision, kap, bal_accuracy, f_meas),
+    control = control_grid(save_pred = TRUE, parallel_over = 'resamples')
+  ) |> 
+  suppressWarnings()  # Suppress "no tuning parameters" warning
+
+cat("✓ Logistic regression complete\n\n")
+
+# Display results
+cat("Logistic Regression Performance:\n")
+cv_results_logistic |> 
+  collect_metrics() |> 
+  select(.metric, mean, std_err) |> 
+  print()
+
+cat("\n")
+```
+
+## Model 2 Random Forest (Tuned)
+```{r}
+# Define recipe for Random Forest (simpler - no interactions needed)
+recipe_rf <- recipe(formula = churn ~ ., data = analysis_set) |> 
+  update_role(id, new_role = 'metadata') |> 
+  step_dummy(all_nominal_predictors()) |> 
+  step_zv(all_predictors())
+
+# Define model specification with tuning parameters
+spec_rf <- rand_forest(
+  mtry = tune(),
+  min_n = tune(),
+  trees = 1000
+) |> 
+  set_engine("ranger", importance = "impurity") |> 
+  set_mode("classification")
+
+# Create workflow
+wf_rf <- workflow() |> 
+  add_recipe(recipe_rf) |> 
+  add_model(spec_rf)
+
+# Tune hyperparameters
+cat("Tuning Random Forest (testing 10 hyperparameter combinations)...\n")
+cat("This may take a few minutes...\n\n")
+
+set.seed(123)
+cv_results_rf <- wf_rf |> 
+  tune_grid(
+    resamples = folds,
+    grid = 10,  # Try 10 random combinations
+    metrics = metric_set(roc_auc, recall, precision, kap, bal_accuracy, f_meas),
+    control = control_grid(save_pred = TRUE, parallel_over = 'resamples')
+  )
+
+cat("✓ Random Forest tuning complete\n\n")
+
+# Display best configurations
+cat("Random Forest - Top 5 Configurations:\n")
+cv_results_rf |> 
+  show_best(metric = "roc_auc", n = 5) |> 
+  select(mtry, min_n, .metric, mean, std_err) |> 
+  print()
+
+cat("\n")
+```
+
+## Model 3: XGBoost (Tuned)
+```{r}
+# Define recipe for XGBoost (requires one-hot encoding)
+recipe_xgb <- recipe(formula = churn ~ ., data = analysis_set) |> 
+  update_role(id, new_role = 'metadata') |> 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) |> 
+  step_zv(all_predictors())
+
+# Define model specification with tuning parameters
+spec_xgb <- boost_tree(
+  trees = 1000,
+  tree_depth = tune(),
+  min_n = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(),
+  mtry = tune(),
+  learn_rate = tune()
+) |> 
+  set_engine("xgboost") |> 
+  set_mode("classification")
+
+# Create workflow
+wf_xgb <- workflow() |> 
+  add_recipe(recipe_xgb) |> 
+  add_model(spec_xgb)
+
+# Tune hyperparameters
+cat("Tuning XGBoost (testing 15 hyperparameter combinations)...\n")
+cat("This will take longer due to more parameters...\n\n")
+
+set.seed(456)
+cv_results_xgb <- wf_xgb |> 
+  tune_grid(
+    resamples = folds,
+    grid = 15,  # Try 15 combinations (XGBoost has many parameters)
+    metrics = metric_set(roc_auc, recall, precision, kap, bal_accuracy, f_meas),
+    control = control_grid(save_pred = TRUE, parallel_over = 'resamples')
+  )
+
+cat("✓ XGBoost tuning complete\n\n")
+
+# Display best configurations
+cat("XGBoost - Top 5 Configurations:\n")
+cv_results_xgb |> 
+  show_best(metric = "roc_auc", n = 5) |> 
+  select(tree_depth, min_n, learn_rate, .metric, mean, std_err) |> 
+  print()
+
+cat("\n")
+```
+
+
+# Part 3: Model Comparison - statistical tests, visualizations
+```{r}
+# 1. ROC AUC COMPARISON (Primary Metric)
+cat("--- ROC AUC COMPARISON ---\n\n")
+
+# Extract best ROC AUC for each model
+logistic_auc <- cv_results_logistic |> 
+  collect_metrics() |> 
+  filter(.metric == "roc_auc") |> 
+  mutate(model = "Logistic Regression")
+
+rf_auc <- cv_results_rf |> 
+  show_best(metric = "roc_auc", n = 1) |> 
+  mutate(model = "Random Forest")
+
+xgb_auc <- cv_results_xgb |> 
+  show_best(metric = "roc_auc", n = 1) |> 
+  mutate(model = "XGBoost")
+
+# Combine and display
+comparison_roc <- bind_rows(logistic_auc, rf_auc, xgb_auc) |> 
+  select(model, mean, std_err) |> 
+  arrange(desc(mean))
+
+print(comparison_roc)
+
+# Identify winner
+winner_model <- comparison_roc$model[1]
+winner_roc <- comparison_roc$mean[1]
+
+cat("\n✓ WINNER (ROC AUC):", winner_model, 
+    "with", round(winner_roc, 4), "\n\n")
+
+# ----------------------------------------------------------------------------
+# 2. ALL METRICS COMPARISON
+# ----------------------------------------------------------------------------
+cat("--- ALL METRICS COMPARISON ---\n\n")
+
+all_metrics_comparison <- bind_rows(
+  collect_metrics(cv_results_logistic) |> mutate(model = "Logistic"),
+  collect_metrics(cv_results_rf) |> mutate(model = "Random Forest"),
+  collect_metrics(cv_results_xgb) |> mutate(model = "XGBoost")
+) |> 
+  select(model, .metric, mean, std_err) |> 
+  pivot_wider(names_from = .metric, 
+              values_from = c(mean, std_err),
+              names_glue = "{.metric}_{.value}")
+
+print(all_metrics_comparison)
+
+cat("\n")
+
+# ----------------------------------------------------------------------------
+# 3. VISUALIZATION: MODEL PERFORMANCE
+# ----------------------------------------------------------------------------
+cat("--- CREATING PERFORMANCE VISUALIZATIONS ---\n\n")
+
+# Prepare data for visualization
+metrics_long <- bind_rows(
+  collect_metrics(cv_results_logistic) |> mutate(model = "Logistic"),
+  collect_metrics(cv_results_rf) |> mutate(model = "Random Forest"),
+  collect_metrics(cv_results_xgb) |> mutate(model = "XGBoost")
+)
+
+# Plot 1: All metrics comparison
+p_all_metrics <- ggplot(metrics_long, aes(x = model, y = mean, fill = model)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = mean - std_err, ymax = mean + std_err), 
+                width = 0.2, alpha = 0.7) +
+  facet_wrap(~.metric, scales = "free_y", ncol = 3) +
+  scale_fill_manual(values = c("Logistic" = pal[1], 
+                                "Random Forest" = pal[2], 
+                                "XGBoost" = pal[3])) +
+  labs(
+    title = "Model Performance Across Multiple Metrics",
+    subtitle = "Error bars show ±1 standard error from cross-validation",
+    y = "Mean Performance",
+    x = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold")
+  )
+
+print(p_all_metrics)
+
+# Plot 2: ROC AUC focused comparison
+p_roc_comparison <- comparison_roc |> 
+  ggplot(aes(x = reorder(model, mean), y = mean, fill = model)) +
+  geom_col(width = 0.6) +
+  geom_errorbar(aes(ymin = mean - std_err, ymax = mean + std_err),
+                width = 0.2, linewidth = 1) +
+  geom_text(aes(label = round(mean, 3)), 
+            vjust = -2, size = 5, fontface = "bold") +
+  scale_fill_manual(values = c("Logistic Regression" = pal[1], 
+                                "Random Forest" = pal[2], 
+                                "XGBoost" = pal[3])) +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.1)) +
+  labs(
+    title = "ROC AUC Comparison: Model Ranking Performance",
+    subtitle = "Higher is better - ability to rank customers by churn risk",
+    y = "ROC AUC",
+    x = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "none",
+    panel.grid.major.x = element_blank(),
+    plot.title = element_text(face = "bold", size = 16)
+  )
+
+print(p_roc_comparison)
+
+# ----------------------------------------------------------------------------
+# 4. STATISTICAL SIGNIFICANCE TESTING
+# ----------------------------------------------------------------------------
+cat("\n--- STATISTICAL SIGNIFICANCE TESTS ---\n\n")
+cat("Testing if performance differences are statistically significant...\n\n")
+
+# Extract ROC AUC for each CV fold - CORRECTED VERSION
+# For tuned models, we need to filter to the BEST configuration only
+
+# Logistic regression (no tuning - all results)
+logistic_scores <- collect_metrics(cv_results_logistic, summarize = FALSE) |> 
+  filter(.metric == "roc_auc") |> 
+  pull(.estimate)
+
+# Random Forest - filter to best configuration only
+best_rf_config <- select_best(cv_results_rf, metric = "roc_auc")$.config
+rf_scores <- collect_metrics(cv_results_rf, summarize = FALSE) |> 
+  filter(.metric == "roc_auc", .config == best_rf_config) |> 
+  pull(.estimate)
+
+# XGBoost - filter to best configuration only
+best_xgb_config <- select_best(cv_results_xgb, metric = "roc_auc")$.config
+xgb_scores <- collect_metrics(cv_results_xgb, summarize = FALSE) |> 
+  filter(.metric == "roc_auc", .config == best_xgb_config) |> 
+  pull(.estimate)
+
+# Verify all have same length
+cat("Number of CV fold results:\n")
+cat("Logistic:", length(logistic_scores), "\n")
+cat("Random Forest:", length(rf_scores), "\n")
+cat("XGBoost:", length(xgb_scores), "\n\n")
+
+# Check if lengths match before running t-tests
+if(length(logistic_scores) == length(rf_scores) && 
+   length(logistic_scores) == length(xgb_scores)) {
+  
+  # Pairwise t-tests (paired because same CV folds)
+  t_xgb_vs_log <- t.test(xgb_scores, logistic_scores, paired = TRUE)
+  t_xgb_vs_rf <- t.test(xgb_scores, rf_scores, paired = TRUE)
+  t_rf_vs_log <- t.test(rf_scores, logistic_scores, paired = TRUE)
+  
+  cat("Pairwise t-tests (paired by CV fold):\n\n")
+  cat("XGBoost vs Logistic:       p =", format.pval(t_xgb_vs_log$p.value, digits = 3), "\n")
+  cat("XGBoost vs Random Forest:  p =", format.pval(t_xgb_vs_rf$p.value, digits = 3), "\n")
+  cat("Random Forest vs Logistic: p =", format.pval(t_rf_vs_log$p.value, digits = 3), "\n\n")
+  
+  # Interpret results
+  if(t_xgb_vs_log$p.value < 0.05 && t_xgb_vs_rf$p.value < 0.05) {
+    cat("✓ XGBoost is STATISTICALLY SIGNIFICANTLY better than both alternatives (p < 0.05)\n")
+  } else if(t_xgb_vs_log$p.value < 0.05) {
+    cat("✓ XGBoost is significantly better than Logistic (p < 0.05)\n")
+    cat("  But not significantly different from Random Forest\n")
+  } else if(t_xgb_vs_rf$p.value < 0.05) {
+    cat("✓ XGBoost is significantly better than Random Forest (p < 0.05)\n")
+    cat("  But not significantly different from Logistic\n")
+  } else {
+    cat("⚠ Performance differences may not be statistically significant\n")
+    cat("  Consider: simpler model may be preferable if performance is similar\n")
+  }
+  
+} else {
+  cat("⚠ WARNING: CV fold counts don't match - cannot perform paired t-tests\n")
+  cat("   Using mean comparison instead:\n\n")
+  
+  cat("Mean ROC AUC:\n")
+  cat("Logistic:      ", round(mean(logistic_scores), 4), "\n")
+  cat("Random Forest: ", round(mean(rf_scores), 4), "\n")
+  cat("XGBoost:       ", round(mean(xgb_scores), 4), "\n\n")
+  
+  cat("Standard deviation:\n")
+  cat("Logistic:      ", round(sd(logistic_scores), 4), "\n")
+  cat("Random Forest: ", round(sd(rf_scores), 4), "\n")
+  cat("XGBoost:       ", round(sd(xgb_scores), 4), "\n")
+}
+
+cat("\n")
+
+```
+
+```{r}
+# How reliable are the predicted probabilities?
+calibration_data <- predictions_2025 |> 
+  mutate(
+    prob_bin = cut(.pred_churned, 
+                   breaks = seq(0, 1, 0.1),
+                   include.lowest = TRUE)
+  ) |> 
+  group_by(prob_bin) |> 
+  summarise(
+    predicted_prob = mean(.pred_churned),
+    actual_churn_rate = mean(churn == "churned"),
+    n = n(),
+    .groups = "drop"
+  ) |> 
+  filter(!is.na(prob_bin))
+
+print(calibration_data)
+
+# Does the model work better for certain customer types?
+segment_performance <- predictions_2025 |> 
+  mutate(
+    segment = case_when(
+      premium == "1" ~ "Premium",
+      tenure <= 2 ~ "New (≤2 years)",
+      TRUE ~ "Standard/Established"
+    )
+  ) |> 
+  group_by(segment) |> 
+  summarise(
+    n = n(),
+    roc_auc = roc_auc_vec(churn, .pred_churned),
+    .groups = "drop"
+  ) |> 
+  arrange(desc(roc_auc))
+
+print(segment_performance)
+```
+
+```{r}
+# ============================================================================
+# MODEL SELECTION & FINALIZATION
+# ============================================================================
+cat(rep("=", 80), "\n", sep = "")
+cat("=== MODEL SELECTION DECISION ===\n")
+cat(rep("=", 80), "\n\n", sep = "")
+
+# Determine which model won based on ROC AUC
+winner_model <- comparison_roc$model[1]
+winner_roc <- comparison_roc$mean[1]
+
+cat("Based on ROC AUC performance, we select:", winner_model, "\n")
+cat("Mean ROC AUC:", round(winner_roc, 4), "\n")
+cat("Standard Error:", round(comparison_roc$std_err[1], 4), "\n\n")
+
+cat("RATIONALE:\n")
+cat("- ROC AUC is our primary metric (need to rank customers by expected loss)\n")
+cat("-", winner_model, "achieved the highest cross-validated ROC AUC\n")
+cat("- Model will be retrained on full analysis set for deployment\n\n")
+
+# Store the winning model for next steps
+if(winner_model == "XGBoost") {
+  final_cv_results <- cv_results_xgb
+  final_wf <- wf_xgb
+  cat("Selected model: XGBoost (boosted trees)\n")
+} else if(winner_model == "Random Forest") {
+  final_cv_results <- cv_results_rf
+  final_wf <- wf_rf
+  cat("Selected model: Random Forest (tree ensemble)\n")
+} else {
+  final_cv_results <- cv_results_logistic
+  final_wf <- wf_logistic
+  cat("Selected model: Logistic Regression (baseline)\n")
+}
+
+cat("\n✓ Final model selected and ready for training\n\n")
+
+cat(rep("=", 80), "\n", sep = "")
+cat("MODEL SELECTION COMPLETE\n")
+cat(rep("=", 80), "\n\n", sep = "")
+```
+
+# Part 4: Final Model Training & Strategy
+```{r}
+# ----------------------------------------------------------------------------
+# STEP 1: SELECT BEST HYPERPARAMETERS & FINALIZE WORKFLOW
+# ----------------------------------------------------------------------------
+cat("--- FINALIZING MODEL WITH BEST HYPERPARAMETERS ---\n\n")
+
+# Get best hyperparameters based on ROC AUC
+best_params <- select_best(final_cv_results, metric = "roc_auc")
+
+cat("Best hyperparameters:\n")
+print(best_params)
+cat("\n")
+
+# Finalize workflow with best parameters
+final_wf_tuned <- final_wf |> 
+  finalize_workflow(best_params)
+
+cat("✓ Workflow finalized with optimal hyperparameters\n\n")
+
+# ----------------------------------------------------------------------------
+# STEP 2: TRAIN ON FULL ANALYSIS SET
+# ----------------------------------------------------------------------------
+cat("--- TRAINING FINAL MODEL ON COMPLETE ANALYSIS SET ---\n")
+cat("Training data: All observations from 2015-2024 (N =", nrow(analysis_set), ")\n\n")
+
+set.seed(999)
+final_fit <- fit(final_wf_tuned, data = analysis_set)
+
+cat("✓ Final model training complete\n\n")
+
+# ----------------------------------------------------------------------------
+# STEP 3: GENERATE PREDICTIONS FOR 2025
+# ----------------------------------------------------------------------------
+cat("--- GENERATING PREDICTIONS FOR 2025 ---\n")
+cat("Assessment data: All observations from 2025 (N =", nrow(assessment_set), ")\n\n")
+
+predictions_2025 <- augment(final_fit, new_data = assessment_set)
+
+cat("✓ Predictions generated\n\n")
+
+# Preview predictions
+cat("Sample predictions:\n")
+predictions_2025 |> 
+  select(id, churn, .pred_class, .pred_churned, .pred_renewed, spend) |> 
+  head(10) |> 
+  print()
+
+cat("\n")
+
+# ----------------------------------------------------------------------------
+# STEP 4: MODEL PERFORMANCE ON 2025 DATA
+# ----------------------------------------------------------------------------
+cat("--- FINAL MODEL PERFORMANCE (2025 Assessment Set) ---\n\n")
+
+# Calculate all metrics
+final_metrics <- predictions_2025 |> 
+  metrics(truth = churn, estimate = .pred_class, .pred_churned) |> 
+  select(.metric, .estimate)
+
+print(final_metrics)
+
+cat("\n")
+
+# Confusion matrix
+cat("Confusion Matrix:\n")
+cm_2025 <- conf_mat(predictions_2025, truth = churn, estimate = .pred_class)
+print(cm_2025)
+
+cat("\n")
+
+# ROC curve
+cat("Creating ROC curve...\n")
+p_roc <- predictions_2025 |> 
+  roc_curve(truth = churn, .pred_churned) |> 
+  autoplot() +
+  labs(
+    title = "ROC Curve: Final Model Performance on 2025 Data",
+    subtitle = paste0("AUC = ", 
+                     round(roc_auc_vec(predictions_2025$churn, 
+                                      predictions_2025$.pred_churned), 3))
+  ) +
+  theme_minimal(base_size = 14)
+
+print(p_roc)
+```
+
+
+# Part 5: Retention Strategy - demonstrate targeting
+```{r}
+# ----------------------------------------------------------------------------
+# STEP 5: CALCULATE EXPECTED LOSS & NET VALUE
+# ----------------------------------------------------------------------------
+cat("--- CALCULATING EXPECTED VALUE FOR EACH CUSTOMER ---\n\n")
+
+retention_cost <- 20000
+
+strategy_data <- predictions_2025 |> 
+  select(id, churn, spend, .pred_churned, sector, premium, tenure) |> 
+  mutate(
+    # Expected loss if customer churns
+    expected_loss = .pred_churned * spend,
+    
+    # Net value of retention effort
+    # (Expected loss we prevent - Cost of intervention)
+    net_value = expected_loss - retention_cost,
+    
+    # Should we target this customer?
+    target_customer = net_value > 0
+  ) |> 
+  # Rank by net value (highest value targets first)
+  arrange(desc(net_value)) |> 
+  mutate(
+    rank = row_number(),
+    cumulative_value = cumsum(net_value)
+  )
+
+cat("Sample of top-ranked customers:\n")
+strategy_data |> 
+  select(rank, id, spend, .pred_churned, expected_loss, net_value, target_customer) |> 
+  head(15) |> 
+  print()
+
+cat("\n")
+
+# ----------------------------------------------------------------------------
+# STEP 6: DETERMINE OPTIMAL NUMBER OF CUSTOMERS TO TARGET
+# ----------------------------------------------------------------------------
+cat("--- DETERMINING OPTIMAL RETENTION CAMPAIGN SIZE ---\n\n")
+
+# Filter to profitable targets only
+target_list <- strategy_data |> 
+  filter(target_customer == TRUE)
+
+optimal_count <- nrow(target_list)
+total_expected_value <- sum(target_list$net_value)
+total_cost <- optimal_count * retention_cost
+
+cat("RETENTION CAMPAIGN RECOMMENDATIONS:\n")
+cat("=====================================\n")
+cat("Number of customers to target:", optimal_count, "\n")
+cat("Total retention budget:       ", scales::dollar(total_cost, prefix = "€"), "\n")
+cat("Total expected value:         ", scales::dollar(total_expected_value, prefix = "€"), "\n")
+cat("Expected ROI:                 ", 
+    scales::percent(total_expected_value / total_cost, accuracy = 0.1), "\n\n")
+
+# Break down by characteristics
+cat("TARGET CUSTOMER PROFILE:\n")
+target_profile <- target_list |> 
+  summarise(
+    median_spend = median(spend),
+    mean_churn_prob = mean(.pred_churned),
+    median_tenure = median(tenure),
+    pct_premium = mean(premium == "1"),
+    .groups = "drop"
+  )
+
+cat("- Median annual spend:     ", scales::dollar(target_profile$median_spend, prefix = "€"), "\n")
+cat("- Average churn probability:", scales::percent(target_profile$mean_churn_prob, accuracy = 0.1), "\n")
+cat("- Median tenure:           ", target_profile$median_tenure, "years\n")
+cat("- Premium customers:       ", scales::percent(target_profile$pct_premium, accuracy = 0.1), "\n\n")
+
+# ----------------------------------------------------------------------------
+# STEP 7: VISUALIZATION - OPTIMAL TARGETING
+# ----------------------------------------------------------------------------
+cat("--- CREATING STRATEGY VISUALIZATIONS ---\n\n")
+
+# Plot 1: Cumulative value curve
+p_cumulative <- ggplot(strategy_data, aes(x = rank, y = cumulative_value)) +
+  geom_line(color = pal[2], linewidth = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+  geom_vline(xintercept = optimal_count, 
+             linetype = "dashed", color = pal[5], linewidth = 1) +
+  annotate("text", 
+           x = optimal_count + 50, 
+           y = max(strategy_data$cumulative_value) * 0.5,
+           label = paste0("Optimal Cutoff:\n", optimal_count, " customers"),
+           color = pal[5], fontface = "bold", size = 4, hjust = 0) +
+  scale_y_continuous(labels = scales::label_dollar(prefix = "€", scale = 1e-6, suffix = "M")) +
+  labs(
+    title = "Optimization of Retention Campaign",
+    subtitle = paste0("Targeting the top ", optimal_count, 
+                     " customers yields €", 
+                     round(total_expected_value/1e6, 2), "M in expected value"),
+    x = "Number of Customers Targeted (Ranked by Expected Value)",
+    y = "Cumulative Net Expected Value"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(face = "bold"))
+
+print(p_cumulative)
+
+# Plot 2: Distribution of expected loss
+p_expected_loss <- strategy_data |> 
+  ggplot(aes(x = expected_loss, fill = target_customer)) +
+  geom_histogram(bins = 50, alpha = 0.8) +
+  geom_vline(xintercept = retention_cost, 
+             linetype = "dashed", color = "red", linewidth = 1) +
+  annotate("text", 
+           x = retention_cost + 5000, 
+           y = Inf,
+           label = paste0("Retention Cost\n€", retention_cost/1000, "K"),
+           color = "red", fontface = "bold", vjust = 1.5) +
+  scale_x_continuous(labels = scales::label_dollar(prefix = "€", scale = 1e-3, suffix = "K"),
+                     limits = c(0, 150000)) +
+  scale_fill_manual(
+    values = c("FALSE" = "gray70", "TRUE" = pal[3]),
+    labels = c("FALSE" = "Not Worth Targeting", "TRUE" = "Target for Retention")
+  ) +
+  labs(
+    title = "Distribution of Expected Loss per Customer",
+    subtitle = "Only target customers where expected loss exceeds retention cost",
+    x = "Expected Loss (Churn Probability × Annual Spend)",
+    y = "Number of Customers",
+    fill = "Targeting Decision"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom")
+
+print(p_expected_loss)
+
+# Plot 3: Priority matrix (Risk vs Value)
+p_matrix <- strategy_data |> 
+  mutate(
+    risk_tier = cut(.pred_churned, 
+                   breaks = c(0, 0.3, 0.5, 0.7, 1),
+                   labels = c("Low", "Medium", "High", "Critical")),
+    value_tier = cut(spend,
+                    breaks = quantile(spend, c(0, 0.25, 0.5, 0.75, 1)),
+                    labels = c("Q1 (Low)", "Q2", "Q3", "Q4 (High)"),
+                    include.lowest = TRUE)
+  ) |> 
+  count(risk_tier, value_tier) |> 
+  ggplot(aes(x = risk_tier, y = value_tier, fill = n, size = n)) +
+  geom_point(shape = 21, color = "white", stroke = 2) +
+  geom_text(aes(label = n), color = "white", fontface = "bold", size = 5) +
+  scale_fill_gradient(low = pal[3], high = pal[5], name = "# Customers") +
+  scale_size_continuous(range = c(10, 30), guide = "none") +
+  labs(
+    title = "Customer Prioritization Matrix: Risk × Value",
+    subtitle = "Focus on high-risk, high-value quadrant (top-right)",
+    x = "Predicted Churn Risk",
+    y = "Customer Value (Revenue Quartile)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(panel.grid = element_blank())
+
+print(p_matrix)
+
+# ----------------------------------------------------------------------------
+# STEP 8: EXPORTABLE TARGET LIST
+# ----------------------------------------------------------------------------
+cat("\n--- TOP 20 CUSTOMERS FOR RETENTION OUTREACH ---\n\n")
+
+actionable_list <- strategy_data |> 
+  filter(target_customer == TRUE) |> 
+  select(
+    Rank = rank,
+    Customer_ID = id,
+    Sector = sector,
+    Premium = premium,
+    Tenure = tenure,
+    Annual_Revenue = spend,
+    Churn_Probability = .pred_churned,
+    Expected_Loss = expected_loss,
+    Net_Value = net_value
+  ) |> 
+  mutate(
+    Annual_Revenue = scales::dollar(Annual_Revenue, prefix = "€"),
+    Churn_Probability = scales::percent(Churn_Probability, accuracy = 0.1),
+    Expected_Loss = scales::dollar(Expected_Loss, prefix = "€"),
+    Net_Value = scales::dollar(Net_Value, prefix = "€"),
+    Premium = if_else(Premium == "1", "Yes", "No")
+  ) |> 
+  head(20)
+
+print(actionable_list)
+
+cat("\n✓ This list can be exported to CSV and provided to the sales team\n\n")
+
+# Optional: Save to CSV
+# write_csv(actionable_list, "retention_targets_2025.csv")
+
+# ----------------------------------------------------------------------------
+# STEP 9: SENSITIVITY ANALYSIS
+# ----------------------------------------------------------------------------
+cat("--- SENSITIVITY ANALYSIS ---\n")
+cat("What if our assumptions about retention cost are wrong?\n\n")
+
+sensitivity_scenarios <- tibble(
+  retention_cost = seq(15000, 30000, by = 2500)
+) |> 
+  mutate(
+    analysis = map(retention_cost, function(cost) {
+      predictions_2025 |> 
+        mutate(
+          expected_loss = .pred_churned * spend,
+          net_value = expected_loss - cost,
+          profitable = net_value > 0
+        ) |> 
+        summarise(
+          n_targets = sum(profitable),
+          total_value = sum(net_value[profitable]),
+          total_cost = n_targets * cost,
+          roi = total_value / total_cost
+        )
+    })
+  ) |> 
+  unnest(analysis)
+
+print(sensitivity_scenarios)
+
+p_sensitivity <- ggplot(sensitivity_scenarios, 
+                        aes(x = retention_cost / 1000, y = total_value / 1e6)) +
+  geom_line(color = pal[2], linewidth = 1.5) +
+  geom_point(size = 3, color = pal[2]) +
+  geom_vline(xintercept = 20, linetype = "dashed", color = pal[5]) +
+  scale_x_continuous(breaks = seq(15, 30, 2.5)) +
+  labs(
+    title = "Sensitivity Analysis: Retention Cost Assumptions",
+    subtitle = "Strategy remains profitable across a range of cost scenarios",
+    x = "Retention Cost per Customer (€ thousands)",
+    y = "Total Expected Value (€ Millions)"
+  ) +
+  theme_minimal(base_size = 14)
+
+print(p_sensitivity)
+
+cat("\n")
+```
+
+
+# Part 6: Summary
+```{r}
+# ============================================================================
+# SUMMARY
+# ============================================================================
+cat(rep("=", 80), "\n", sep = "")
+cat("=== DEPLOYMENT SUMMARY ===\n")
+cat(rep("=", 80), "\n\n", sep = "")
+
+cat("MODEL PERFORMANCE:\n")
+cat("- ROC AUC on 2025 data:", 
+    round(roc_auc_vec(predictions_2025$churn, predictions_2025$.pred_churned), 3), "\n")
+cat("- Model successfully ranks customers by churn risk\n\n")
+
+cat("RETENTION STRATEGY:\n")
+cat("- Target customers:", optimal_count, "\n")
+cat("- Required budget: €", format(total_cost/1e6, digits = 2), "M\n")
+cat("- Expected value: €", format(total_expected_value/1e6, digits = 2), "M\n")
+cat("- Expected ROI:", scales::percent(total_expected_value / total_cost, accuracy = 1), "\n\n")
+
+cat("NEXT STEPS:\n")
+cat("1. Review top 20-50 customers with account managers\n")
+cat("2. Initiate retention outreach (prioritize premium customers)\n")
+cat("3. Track success rate to calibrate future predictions\n")
+cat("4. Retrain model quarterly as new data becomes available\n")
+cat("5. Investigate root causes of premium customer churn\n\n")
+
+cat(rep("=", 80), "\n", sep = "")
+cat("ANALYSIS COMPLETE - READY FOR PRESENTATION\n")
+cat(rep("=", 80), "\n", sep = "")
+
+```
